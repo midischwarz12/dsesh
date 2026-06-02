@@ -1,0 +1,38 @@
+.TH DSESH 1 "June 2026" "dsesh 0.1.0" "User Commands"
+.SH NAME
+dsesh \- detachable terminal sessions with retained screen state
+.SH SYNOPSIS
+.B dsesh
+.RI [ options ]
+.B new
+.RI socket
+.B --
+.RI command
+.br
+.B dsesh
+.RI [ options ]
+.B attach
+.RI socket
+.SH DESCRIPTION
+.B dsesh
+runs one command behind a Unix socket. Clients can detach and reattach while the
+server keeps a vt100 screen model, so reattachment redraws the latest retained
+terminal state before live output resumes.
+.SH COMMANDS
+.TP
+.B new SOCKET -- COMMAND [ARGS...]
+Start a new session and attach to it.
+.TP
+.B attach SOCKET
+Attach to an existing session socket.
+.TP
+.B run SOCKET -- COMMAND [ARGS...]
+Attach to SOCKET if it exists, otherwise create the session and attach.
+.SH KEYS
+.TP
+.B Ctrl-\e
+Detach the current client without stopping the child process.
+.SH OPTIONS
+.TP
+.B --cols N, --rows N
+Initial PTY size used when the client terminal size cannot be detected.
