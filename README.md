@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 midischwarz12
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # dsesh
 
 `dsesh` is a small detachable terminal session runner. It is intentionally closer

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 midischwarz12
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::Shutdown;
