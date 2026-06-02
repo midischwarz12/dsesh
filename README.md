@@ -107,6 +107,11 @@ The E2E test starts a detached session through the real binary and checks that a
 second attach receives previously emitted screen content through the retained
 screen snapshot.
 
+## License
+
+`dsesh` is licensed under the GNU Affero General Public License v3.0 or later.
+See `LICENSE` for the full license text.
+
 ## Design limits
 
 `dsesh` deliberately avoids terminal multiplexing and rich session management.
