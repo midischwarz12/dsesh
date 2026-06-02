@@ -42,6 +42,15 @@ Use `run` for dtach-like "attach if it exists, otherwise create it":
 dsesh run /tmp/shell.dsesh -- "$SHELL"
 ```
 
+When the socket already exists, `run` does not need a command:
+
+```sh
+dsesh run /tmp/shell.dsesh
+```
+
+`dsesh` prints `[detached]` after a client detaches and
+`[EOF - ended session]` when the child process exits or is terminated.
+
 ## Model
 
 `dsesh` has two moving pieces:
@@ -110,7 +119,7 @@ cargo test --workspace --all-targets
 
 The E2E test starts a detached session through the real binary and checks that a
 second attach receives previously emitted screen content through the retained
-screen snapshot.
+screen snapshot. It also checks detach, EOF, `run SOCKET`, and Ctrl-C handling.
 
 ## License
 

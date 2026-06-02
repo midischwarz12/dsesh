@@ -9,12 +9,21 @@ tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
 sock="$tmpdir/session.sock"
+sig_sock="$tmpdir/signalled.sock"
 first="$tmpdir/first.out"
 second="$tmpdir/second.out"
+signalled="$tmpdir/signalled.out"
 
 cargo build --quiet --bin dsesh
 
 printf '\034' | "$bin" new "$sock" -- sh -c 'printf "retained-screen-ok\n"; sleep 1' >"$first"
+
+if ! grep -q '\[detached\]' "$first"; then
+  echo "detached client did not print detach marker" >&2
+  echo "--- detach output ---" >&2
+  sed -n '1,120p' "$first" >&2
+  exit 1
+fi
 
 for _ in {1..100}; do
   if [ -S "$sock" ]; then
@@ -28,11 +37,35 @@ if [ ! -S "$sock" ]; then
   exit 1
 fi
 
-"$bin" attach "$sock" >"$second"
+"$bin" run "$sock" >"$second"
 
 if ! grep -q 'retained-screen-ok' "$second"; then
   echo "reattached client did not receive retained screen contents" >&2
   echo "--- attach output ---" >&2
   sed -n '1,120p' "$second" >&2
+  exit 1
+fi
+
+if ! grep -q '\[EOF - ended session\]' "$second"; then
+  echo "ended session did not print EOF marker" >&2
+  echo "--- attach output ---" >&2
+  sed -n '1,120p' "$second" >&2
+  exit 1
+fi
+
+set +e
+printf '\003' | "$bin" new "$sig_sock" -- sh -c 'sleep 10' >"$signalled"
+signalled_status=$?
+set -e
+
+if [ "$signalled_status" -eq 0 ]; then
+  echo "ctrl-c test command unexpectedly exited successfully" >&2
+  exit 1
+fi
+
+if ! grep -q '\[EOF - ended session\]' "$signalled"; then
+  echo "signalled session did not print EOF marker" >&2
+  echo "--- signalled output ---" >&2
+  sed -n '1,120p' "$signalled" >&2
   exit 1
 fi

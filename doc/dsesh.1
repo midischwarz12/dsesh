@@ -29,11 +29,19 @@ Start a new session and attach to it.
 Attach to an existing session socket.
 .TP
 .B run SOCKET -- COMMAND [ARGS...]
-Attach to SOCKET if it exists, otherwise create the session and attach.
+Attach to SOCKET if it exists, otherwise create the session and attach. When
+SOCKET already exists, COMMAND may be omitted.
 .SH KEYS
 .TP
 .B Ctrl-\e
 Detach the current client without stopping the child process.
+.SH STATUS MESSAGES
+.TP
+.B [detached]
+Printed when the current client detaches from a live session.
+.TP
+.B [EOF - ended session]
+Printed when the child process exits or is terminated and the session ends.
 .SH OPTIONS
 .TP
 .B --cols N, --rows N

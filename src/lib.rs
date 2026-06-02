@@ -44,7 +44,7 @@ enum Commands {
     /// Attach to an existing socket, or start a new session first.
     Run {
         socket: PathBuf,
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
     #[command(hide = true)]
@@ -311,10 +311,11 @@ fn attach(socket: &Path, fallback_rows: u16, fallback_cols: u16) -> Result<()> {
     write_frame(&mut stream, &ClientMessage::Resize { rows, cols })?;
 
     let raw = io::stdin().is_terminal() && io::stdout().is_terminal();
-    let _guard = if raw { Some(RawMode::enter()?) } else { None };
+    let guard = if raw { Some(RawMode::enter()?) } else { None };
 
     let mut input_stream = stream.try_clone().context("clone stream input")?;
-    let input = thread::spawn(move || {
+    let (detach_tx, detach_rx) = mpsc::channel();
+    thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         let mut buf = [0; 1024];
         loop {
@@ -329,6 +330,7 @@ fn attach(socket: &Path, fallback_rows: u16, fallback_cols: u16) -> Result<()> {
                             );
                         }
                         let _ = write_frame(&mut input_stream, &ClientMessage::Detach);
+                        let _ = detach_tx.send(());
                         break;
                     }
                     if write_frame(&mut input_stream, &ClientMessage::Input(buf[..n].to_vec()))
@@ -344,7 +346,15 @@ fn attach(socket: &Path, fallback_rows: u16, fallback_cols: u16) -> Result<()> {
     });
 
     let exit = read_server_output(&mut stream)?;
-    let _ = input.join();
+    let detached = detach_rx.try_recv().is_ok();
+    drop(guard);
+
+    if detached {
+        println!("[detached]");
+    } else if exit.is_some() {
+        println!("[EOF - ended session]");
+    }
+
     match exit {
         Some(0) | None => Ok(()),
         Some(code) => std::process::exit(code),
