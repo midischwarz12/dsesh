@@ -4,6 +4,7 @@
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::Shutdown;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -12,7 +13,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 const DETACH: u8 = 0x1c; // Ctrl-\
@@ -423,7 +423,7 @@ fn spawn_server_thread(
 fn attach(socket: &Path, fallback_rows: u16, fallback_cols: u16) -> Result<()> {
     let mut stream =
         UnixStream::connect(socket).with_context(|| format!("connect {}", socket.display()))?;
-    let (cols, rows) = size().unwrap_or((fallback_cols, fallback_rows));
+    let (cols, rows) = terminal_size().unwrap_or((fallback_cols, fallback_rows));
     write_client_frame(&mut stream, &ClientMessage::Resize { rows, cols })?;
 
     let raw = io::stdin().is_terminal() && io::stdout().is_terminal();
@@ -592,17 +592,67 @@ fn read_frame_body(reader: &mut impl Read) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-struct RawMode;
+struct RawMode {
+    fd: i32,
+    original: libc::termios,
+}
 
 impl RawMode {
     fn enter() -> Result<Self> {
-        enable_raw_mode().context("enable terminal raw mode")?;
-        Ok(Self)
+        let fd = io::stdin().as_raw_fd();
+        let original = termios(fd).context("read terminal mode")?;
+        let mut raw = original;
+
+        raw.c_iflag &= !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
+        raw.c_oflag &= !libc::OPOST;
+        raw.c_cflag |= libc::CS8;
+        raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+
+        set_termios(fd, &raw).context("enable terminal raw mode")?;
+        Ok(Self { fd, original })
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
+        let _ = set_termios(self.fd, &self.original);
+    }
+}
+
+fn terminal_size() -> Option<(u16, u16)> {
+    let fd = io::stdout().as_raw_fd();
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+
+    let result = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) };
+    if result == 0 && size.ws_col > 0 && size.ws_row > 0 {
+        Some((size.ws_col, size.ws_row))
+    } else {
+        None
+    }
+}
+
+fn termios(fd: i32) -> io::Result<libc::termios> {
+    let mut termios = std::mem::MaybeUninit::uninit();
+    let result = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
+    if result == 0 {
+        Ok(unsafe { termios.assume_init() })
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn set_termios(fd: i32, termios: &libc::termios) -> io::Result<()> {
+    let result = unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, termios) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }

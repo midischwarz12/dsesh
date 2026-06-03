@@ -23,6 +23,7 @@ signalled="$tmpdir/signalled.out"
 thread_out="$tmpdir/thread-regression.out"
 alt_first="$tmpdir/alternate-first.out"
 alt_second="$tmpdir/alternate-second.out"
+alt_ready="$tmpdir/alternate-ready"
 
 cargo build --quiet --bin dsesh
 
@@ -123,15 +124,25 @@ fi
 
 printf '\003' | "$bin" run "$thread_sock" >/dev/null || true
 
-{ sleep 0.5; printf '\034'; } | "$bin" new "$alt_sock" -- sh -c '
+{
+  for _ in {1..100}; do
+    if [ -e "$alt_ready" ]; then
+      break
+    fi
+    sleep 0.02
+  done
+  printf '\034'
+} | "$bin" --rows 24 --cols 80 new "$alt_sock" -- sh -c '
+  ready=$1
   printf "\033[?1049h"
   printf "\033[2J\033[HSTALE-BEFORE-CLEAR"
   printf "\033[2J\033[H"
   printf "\033[1;1HCODEX-LIKE-HEADER"
   printf "\033[5;10HSTATUS READY"
   printf "\033[24;1Hprompt> "
+  : > "$ready"
   sleep 10
-' >"$alt_first"
+' sh "$alt_ready" >"$alt_first"
 
 for _ in {1..100}; do
   if [ -S "$alt_sock" ]; then
@@ -145,7 +156,7 @@ if [ ! -S "$alt_sock" ]; then
   exit 1
 fi
 
-printf '\034' | "$bin" run "$alt_sock" >"$alt_second"
+{ sleep 0.1; printf '\034'; } | "$bin" --rows 24 --cols 80 run "$alt_sock" >"$alt_second"
 
 if ! grep -q 'CODEX-LIKE-HEADER' "$alt_second"; then
   echo "alternate-screen reattach did not retain header" >&2
