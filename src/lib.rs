@@ -540,15 +540,32 @@ enum OutputResult {
 fn read_server_output(stream: &mut UnixStream) -> Result<OutputResult> {
     let mut stdout = io::stdout().lock();
     loop {
-        match read_server_frame(stream) {
-            Ok(ServerMessage::Snapshot(bytes) | ServerMessage::Output(bytes)) => {
-                stdout.write_all(&bytes)?;
+        match read_frame_header(stream) {
+            Ok(FrameHeader {
+                tag: 1 | 2,
+                payload_len,
+            }) => {
+                copy_exact(stream, &mut stdout, payload_len)?;
                 stdout.flush()?;
             }
-            Ok(ServerMessage::Detached) => return Ok(OutputResult::Detached),
-            Ok(ServerMessage::Close) => return Ok(OutputResult::Disconnected),
-            Ok(ServerMessage::Exit(code)) => return Ok(OutputResult::Exit(code)),
+            Ok(FrameHeader {
+                tag: 3,
+                payload_len: 0,
+            }) => return Ok(OutputResult::Detached),
+            Ok(FrameHeader {
+                tag: 4,
+                payload_len: 0,
+            }) => return Ok(OutputResult::Disconnected),
+            Ok(FrameHeader {
+                tag: 5,
+                payload_len: 4,
+            }) => {
+                let mut code = [0; 4];
+                stream.read_exact(&mut code).context("read exit status")?;
+                return Ok(OutputResult::Exit(i32::from_be_bytes(code)));
+            }
             Err(_) => return Ok(OutputResult::Disconnected),
+            Ok(_) => return Ok(OutputResult::Disconnected),
         }
     }
 }
@@ -590,44 +607,68 @@ fn write_frame(writer: &mut impl Write, tag: u8, payload: &[u8]) -> Result<()> {
 }
 
 fn read_client_frame(reader: &mut impl Read) -> Result<ClientMessage> {
-    let body = read_frame_body(reader)?;
-    let (&tag, payload) = body.split_first().context("empty client frame")?;
-    match tag {
-        1 => Ok(ClientMessage::Input(payload.to_vec())),
-        2 if payload.len() == 4 => Ok(ClientMessage::Resize {
-            rows: u16::from_be_bytes([payload[0], payload[1]]),
-            cols: u16::from_be_bytes([payload[2], payload[3]]),
-        }),
-        3 if payload.is_empty() => Ok(ClientMessage::Detach),
+    let header = read_frame_header(reader)?;
+    match header.tag {
+        1 => Ok(ClientMessage::Input(read_payload(
+            reader,
+            header.payload_len,
+        )?)),
+        2 if header.payload_len == 4 => {
+            let mut payload = [0; 4];
+            reader
+                .read_exact(&mut payload)
+                .context("read resize payload")?;
+            Ok(ClientMessage::Resize {
+                rows: u16::from_be_bytes([payload[0], payload[1]]),
+                cols: u16::from_be_bytes([payload[2], payload[3]]),
+            })
+        }
+        3 if header.payload_len == 0 => Ok(ClientMessage::Detach),
         _ => bail!("invalid client frame"),
     }
 }
 
-fn read_server_frame(reader: &mut impl Read) -> Result<ServerMessage> {
-    let body = read_frame_body(reader)?;
-    let (&tag, payload) = body.split_first().context("empty server frame")?;
-    match tag {
-        1 => Ok(ServerMessage::Snapshot(Payload::from(payload))),
-        2 => Ok(ServerMessage::Output(Payload::from(payload))),
-        3 if payload.is_empty() => Ok(ServerMessage::Detached),
-        4 if payload.is_empty() => Ok(ServerMessage::Close),
-        5 if payload.len() == 4 => Ok(ServerMessage::Exit(i32::from_be_bytes([
-            payload[0], payload[1], payload[2], payload[3],
-        ]))),
-        _ => bail!("invalid server frame"),
-    }
+struct FrameHeader {
+    tag: u8,
+    payload_len: usize,
 }
 
-fn read_frame_body(reader: &mut impl Read) -> Result<Vec<u8>> {
+fn read_frame_header(reader: &mut impl Read) -> Result<FrameHeader> {
     let mut len = [0; 4];
     reader.read_exact(&mut len).context("read frame length")?;
     let len = u32::from_be_bytes(len) as usize;
-    if len > MAX_FRAME_SIZE {
+    if len == 0 || len > MAX_FRAME_SIZE {
         bail!("frame too large");
     }
-    let mut body = vec![0; len];
-    reader.read_exact(&mut body).context("read frame body")?;
-    Ok(body)
+    let mut tag = [0; 1];
+    reader.read_exact(&mut tag).context("read frame tag")?;
+    Ok(FrameHeader {
+        tag: tag[0],
+        payload_len: len - 1,
+    })
+}
+
+fn read_payload(reader: &mut impl Read, len: usize) -> Result<Vec<u8>> {
+    let mut payload = vec![0; len];
+    reader
+        .read_exact(&mut payload)
+        .context("read frame payload")?;
+    Ok(payload)
+}
+
+fn copy_exact(reader: &mut impl Read, writer: &mut impl Write, mut len: usize) -> Result<()> {
+    let mut buf = [0; 8192];
+    while len > 0 {
+        let chunk = len.min(buf.len());
+        reader
+            .read_exact(&mut buf[..chunk])
+            .context("read frame payload")?;
+        writer
+            .write_all(&buf[..chunk])
+            .context("write frame payload")?;
+        len -= chunk;
+    }
+    Ok(())
 }
 
 struct RawMode {
