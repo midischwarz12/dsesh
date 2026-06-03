@@ -6,13 +6,20 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 bin="${CARGO_BIN_EXE_dsesh:-"$root/target/debug/dsesh"}"
 tmpdir="$(mktemp -d)"
-trap 'rm -rf "$tmpdir"' EXIT
+cleanup() {
+  set +e
+  pkill -f "$tmpdir" >/dev/null 2>&1
+  rm -rf "$tmpdir"
+}
+trap cleanup EXIT
 
 sock="$tmpdir/session.sock"
 sig_sock="$tmpdir/signalled.sock"
+thread_sock="$tmpdir/thread-regression.sock"
 first="$tmpdir/first.out"
 second="$tmpdir/second.out"
 signalled="$tmpdir/signalled.out"
+thread_out="$tmpdir/thread-regression.out"
 
 cargo build --quiet --bin dsesh
 
@@ -69,3 +76,46 @@ if ! grep -q '\[EOF - ended session\]' "$signalled"; then
   sed -n '1,120p' "$signalled" >&2
   exit 1
 fi
+
+printf '\034' | "$bin" new "$thread_sock" -- sh -c 'sleep 10' >"$thread_out"
+
+for _ in {1..100}; do
+  if [ -S "$thread_sock" ]; then
+    break
+  fi
+  sleep 0.02
+done
+
+if [ ! -S "$thread_sock" ]; then
+  echo "thread regression session socket was not created" >&2
+  exit 1
+fi
+
+server_pid=""
+for _ in {1..100}; do
+  server_pid="$(pgrep -f "dsesh.*server $thread_sock" | head -n1 || true)"
+  if [ -n "$server_pid" ]; then
+    break
+  fi
+  sleep 0.02
+done
+
+if [ -z "$server_pid" ]; then
+  echo "could not find dsesh server process for thread regression test" >&2
+  exit 1
+fi
+
+for _ in {1..50}; do
+  printf '\034' | "$bin" run "$thread_sock" >/dev/null
+done
+
+sleep 0.2
+threads="$(awk '/^Threads:/ {print $2}' "/proc/$server_pid/status")"
+
+if [ "$threads" -gt 4 ]; then
+  echo "quiet detach leaked server threads: $threads" >&2
+  ps -L -p "$server_pid" -o pid,tid,stat,comm >&2 || true
+  exit 1
+fi
+
+printf '\003' | "$bin" run "$thread_sock" >/dev/null || true

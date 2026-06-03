@@ -19,6 +19,7 @@ const DETACH: u8 = 0x1c; // Ctrl-\
 const SNAPSHOT_PREFIX: &[u8] = b"\x1b[?1049l\x1b[2J\x1b[H";
 const SERVER_THREAD_STACK: usize = 256 * 1024;
 const EXIT_DRAIN: Duration = Duration::from_millis(50);
+const MAX_FRAME_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug)]
 struct Cli {
@@ -540,6 +541,9 @@ fn write_server_frame(writer: &mut impl Write, value: &ServerMessage) -> Result<
 }
 
 fn write_frame_body(writer: &mut impl Write, body: &[u8]) -> Result<()> {
+    if body.len() > MAX_FRAME_SIZE {
+        bail!("frame too large");
+    }
     let len = u32::try_from(body.len()).context("frame too large")?;
     writer.write_all(&len.to_be_bytes())?;
     writer.write_all(body)?;
@@ -580,6 +584,9 @@ fn read_frame_body(reader: &mut impl Read) -> Result<Vec<u8>> {
     let mut len = [0; 4];
     reader.read_exact(&mut len).context("read frame length")?;
     let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_FRAME_SIZE {
+        bail!("frame too large");
+    }
     let mut body = vec![0; len];
     reader.read_exact(&mut body).context("read frame body")?;
     Ok(body)
