@@ -16,10 +16,13 @@ trap cleanup EXIT
 sock="$tmpdir/session.sock"
 sig_sock="$tmpdir/signalled.sock"
 thread_sock="$tmpdir/thread-regression.sock"
+alt_sock="$tmpdir/alternate-screen.sock"
 first="$tmpdir/first.out"
 second="$tmpdir/second.out"
 signalled="$tmpdir/signalled.out"
 thread_out="$tmpdir/thread-regression.out"
+alt_first="$tmpdir/alternate-first.out"
+alt_second="$tmpdir/alternate-second.out"
 
 cargo build --quiet --bin dsesh
 
@@ -119,3 +122,57 @@ if [ "$threads" -gt 4 ]; then
 fi
 
 printf '\003' | "$bin" run "$thread_sock" >/dev/null || true
+
+{ sleep 0.5; printf '\034'; } | "$bin" new "$alt_sock" -- sh -c '
+  printf "\033[?1049h"
+  printf "\033[2J\033[HSTALE-BEFORE-CLEAR"
+  printf "\033[2J\033[H"
+  printf "\033[1;1HCODEX-LIKE-HEADER"
+  printf "\033[5;10HSTATUS READY"
+  printf "\033[24;1Hprompt> "
+  sleep 10
+' >"$alt_first"
+
+for _ in {1..100}; do
+  if [ -S "$alt_sock" ]; then
+    break
+  fi
+  sleep 0.02
+done
+
+if [ ! -S "$alt_sock" ]; then
+  echo "alternate-screen session socket was not created" >&2
+  exit 1
+fi
+
+printf '\034' | "$bin" run "$alt_sock" >"$alt_second"
+
+if ! grep -q 'CODEX-LIKE-HEADER' "$alt_second"; then
+  echo "alternate-screen reattach did not retain header" >&2
+  echo "--- alternate reattach output ---" >&2
+  sed -n '1,160p' "$alt_second" >&2
+  exit 1
+fi
+
+if ! grep -q 'STATUS READY' "$alt_second"; then
+  echo "alternate-screen reattach did not retain positioned status text" >&2
+  echo "--- alternate reattach output ---" >&2
+  sed -n '1,160p' "$alt_second" >&2
+  exit 1
+fi
+
+if grep -q 'STALE-BEFORE-CLEAR' "$alt_second"; then
+  echo "alternate-screen reattach included stale cleared content" >&2
+  echo "--- alternate reattach output ---" >&2
+  sed -n '1,160p' "$alt_second" >&2
+  exit 1
+fi
+
+if ! grep -q '\[detached\]' "$alt_second"; then
+  echo "alternate-screen reattach did not detach cleanly" >&2
+  echo "--- alternate reattach output ---" >&2
+  sed -n '1,160p' "$alt_second" >&2
+  exit 1
+fi
+
+printf '\003' | "$bin" run "$alt_sock" >/dev/null || true
