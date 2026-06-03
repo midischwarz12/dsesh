@@ -475,7 +475,7 @@ fn attach(socket: &Path, fallback_rows: u16, fallback_cols: u16) -> Result<()> {
     let mut stream =
         UnixStream::connect(socket).with_context(|| format!("connect {}", socket.display()))?;
     let (cols, rows) = terminal_size().unwrap_or((fallback_cols, fallback_rows));
-    write_client_frame(&mut stream, &ClientMessage::Resize { rows, cols })?;
+    write_client_resize_frame(&mut stream, rows, cols)?;
 
     let raw = io::stdin().is_terminal() && io::stdout().is_terminal();
     let guard = if raw { Some(RawMode::enter()?) } else { None };
@@ -491,21 +491,13 @@ fn attach(socket: &Path, fallback_rows: u16, fallback_cols: u16) -> Result<()> {
                 Ok(n) => {
                     if let Some(pos) = buf[..n].iter().position(|byte| *byte == DETACH) {
                         if pos > 0 {
-                            let _ = write_client_frame(
-                                &mut input_stream,
-                                &ClientMessage::Input(buf[..pos].to_vec()),
-                            );
+                            let _ = write_client_input_frame(&mut input_stream, &buf[..pos]);
                         }
-                        let _ = write_client_frame(&mut input_stream, &ClientMessage::Detach);
+                        let _ = write_client_detach_frame(&mut input_stream);
                         let _ = detach_tx.send(());
                         break;
                     }
-                    if write_client_frame(
-                        &mut input_stream,
-                        &ClientMessage::Input(buf[..n].to_vec()),
-                    )
-                    .is_err()
-                    {
+                    if write_client_input_frame(&mut input_stream, &buf[..n]).is_err() {
                         break;
                     }
                 }
@@ -570,17 +562,19 @@ fn read_server_output(stream: &mut UnixStream) -> Result<OutputResult> {
     }
 }
 
-fn write_client_frame(writer: &mut impl Write, value: &ClientMessage) -> Result<()> {
-    match value {
-        ClientMessage::Input(bytes) => write_frame(writer, 1, bytes),
-        ClientMessage::Resize { rows, cols } => {
-            let mut payload = [0; 4];
-            payload[..2].copy_from_slice(&rows.to_be_bytes());
-            payload[2..].copy_from_slice(&cols.to_be_bytes());
-            write_frame(writer, 2, &payload)
-        }
-        ClientMessage::Detach => write_frame(writer, 3, &[]),
-    }
+fn write_client_input_frame(writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
+    write_frame(writer, 1, bytes)
+}
+
+fn write_client_resize_frame(writer: &mut impl Write, rows: u16, cols: u16) -> Result<()> {
+    let mut payload = [0; 4];
+    payload[..2].copy_from_slice(&rows.to_be_bytes());
+    payload[2..].copy_from_slice(&cols.to_be_bytes());
+    write_frame(writer, 2, &payload)
+}
+
+fn write_client_detach_frame(writer: &mut impl Write) -> Result<()> {
+    write_frame(writer, 3, &[])
 }
 
 fn write_server_frame(writer: &mut impl Write, value: &ServerMessage) -> Result<()> {
