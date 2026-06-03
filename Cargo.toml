@@ -23,3 +23,9 @@ vt100 = "0.15.2"
 [dev-dependencies]
 assert_cmd = "2.0.14"
 predicates = "3.1.0"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = true

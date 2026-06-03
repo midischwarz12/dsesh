@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 
 const DETACH: u8 = 0x1c; // Ctrl-\
 const SNAPSHOT_PREFIX: &[u8] = b"\x1b[?1049l\x1b[2J\x1b[H";
+const SERVER_THREAD_STACK: usize = 256 * 1024;
+const EXIT_DRAIN: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -66,6 +68,8 @@ enum ClientMessage {
 enum ServerMessage {
     Snapshot(Vec<u8>),
     Output(Vec<u8>),
+    Detached,
+    Close,
     Exit(i32),
 }
 
@@ -106,6 +110,7 @@ fn start_server(socket: &Path, rows: u16, cols: u16, command: &[String]) -> Resu
         .arg(socket)
         .arg("--")
         .args(command)
+        .env("MALLOC_ARENA_MAX", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -172,7 +177,7 @@ fn server(socket: &Path, rows: u16, cols: u16, command: &[String]) -> Result<()>
     {
         let clients = Arc::clone(&clients);
         let screen = Arc::clone(&screen);
-        thread::spawn(move || {
+        spawn_server_thread("pty-reader", move || {
             let mut buf = [0; 8192];
             loop {
                 match pty_reader.read(&mut buf) {
@@ -187,7 +192,7 @@ fn server(socket: &Path, rows: u16, cols: u16, command: &[String]) -> Result<()>
                     Err(_) => break,
                 }
             }
-        });
+        })?;
     }
 
     let listener = UnixListener::bind(socket)
@@ -196,29 +201,24 @@ fn server(socket: &Path, rows: u16, cols: u16, command: &[String]) -> Result<()>
         .set_nonblocking(true)
         .context("set listener nonblocking")?;
 
-    let exit_clients = Arc::clone(&clients);
-    let exit_socket = socket.to_owned();
-    thread::spawn(move || {
-        let code = child
-            .wait()
-            .ok()
-            .map(|status| status.exit_code().min(i32::MAX as u32) as i32)
-            .unwrap_or(1);
-        broadcast(&exit_clients, ServerMessage::Exit(code));
-        let _ = fs::remove_file(exit_socket);
-        std::process::exit(code);
-    });
-
     loop {
+        if let Some(status) = child.try_wait().context("poll child process")? {
+            let code = status.exit_code().min(i32::MAX as u32) as i32;
+            broadcast(&clients, ServerMessage::Exit(code));
+            let _ = fs::remove_file(socket);
+            thread::sleep(EXIT_DRAIN);
+            std::process::exit(code);
+        }
+
         match listener.accept() {
             Ok((stream, _)) => {
                 let screen = Arc::clone(&screen);
                 let clients = Arc::clone(&clients);
                 let pty_writer = Arc::clone(&pty_writer);
                 let master = Arc::clone(&master);
-                thread::spawn(move || {
+                spawn_server_thread("client-reader", move || {
                     let _ = handle_client(stream, screen, clients, pty_writer, master);
-                });
+                })?;
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
@@ -245,17 +245,20 @@ fn handle_client(
         .context("queue snapshot")?;
 
     let mut writer_stream = stream.try_clone().context("clone stream writer")?;
-    thread::spawn(move || {
+    spawn_server_thread("client-writer", move || {
         for message in rx {
+            if matches!(message, ServerMessage::Close) {
+                break;
+            }
             if write_frame(&mut writer_stream, &message).is_err() {
                 break;
             }
-            if matches!(message, ServerMessage::Exit(_)) {
+            if matches!(message, ServerMessage::Detached | ServerMessage::Exit(_)) {
                 break;
             }
         }
         let _ = writer_stream.shutdown(Shutdown::Both);
-    });
+    })?;
 
     let mut reader_stream = stream;
     loop {
@@ -282,8 +285,14 @@ fn handle_client(
                     })
                     .context("resize pty")?;
             }
-            Ok(ClientMessage::Detach) => break,
-            Err(_) => break,
+            Ok(ClientMessage::Detach) => {
+                let _ = tx.send(ServerMessage::Detached);
+                break;
+            }
+            Err(_) => {
+                let _ = tx.send(ServerMessage::Close);
+                break;
+            }
         }
     }
 
@@ -302,6 +311,17 @@ fn broadcast(clients: &Mutex<Vec<mpsc::Sender<ServerMessage>>>, message: ServerM
     if let Ok(mut clients) = clients.lock() {
         clients.retain(|client| client.send(message.clone()).is_ok());
     }
+}
+
+fn spawn_server_thread(
+    name: &'static str,
+    f: impl FnOnce() + Send + 'static,
+) -> Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name(format!("dsesh-{name}"))
+        .stack_size(SERVER_THREAD_STACK)
+        .spawn(f)
+        .with_context(|| format!("spawn {name} thread"))
 }
 
 fn attach(socket: &Path, fallback_rows: u16, fallback_cols: u16) -> Result<()> {
@@ -345,23 +365,29 @@ fn attach(socket: &Path, fallback_rows: u16, fallback_cols: u16) -> Result<()> {
         }
     });
 
-    let exit = read_server_output(&mut stream)?;
+    let output = read_server_output(&mut stream)?;
     let detached = detach_rx.try_recv().is_ok();
     drop(guard);
 
-    if detached {
+    if detached || matches!(output, OutputResult::Detached) {
         println!("[detached]");
-    } else if exit.is_some() {
+    } else if matches!(output, OutputResult::Exit(_)) {
         println!("[EOF - ended session]");
     }
 
-    match exit {
-        Some(0) | None => Ok(()),
-        Some(code) => std::process::exit(code),
+    match output {
+        OutputResult::Exit(0) | OutputResult::Disconnected | OutputResult::Detached => Ok(()),
+        OutputResult::Exit(code) => std::process::exit(code),
     }
 }
 
-fn read_server_output(stream: &mut UnixStream) -> Result<Option<i32>> {
+enum OutputResult {
+    Detached,
+    Disconnected,
+    Exit(i32),
+}
+
+fn read_server_output(stream: &mut UnixStream) -> Result<OutputResult> {
     let mut stdout = io::stdout().lock();
     loop {
         match read_frame::<ServerMessage>(stream) {
@@ -369,8 +395,10 @@ fn read_server_output(stream: &mut UnixStream) -> Result<Option<i32>> {
                 stdout.write_all(&bytes)?;
                 stdout.flush()?;
             }
-            Ok(ServerMessage::Exit(code)) => return Ok(Some(code)),
-            Err(_) => return Ok(None),
+            Ok(ServerMessage::Detached) => return Ok(OutputResult::Detached),
+            Ok(ServerMessage::Close) => return Ok(OutputResult::Disconnected),
+            Ok(ServerMessage::Exit(code)) => return Ok(OutputResult::Exit(code)),
+            Err(_) => return Ok(OutputResult::Disconnected),
         }
     }
 }
