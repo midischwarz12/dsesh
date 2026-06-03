@@ -21,6 +21,8 @@ const SERVER_THREAD_STACK: usize = 256 * 1024;
 const EXIT_DRAIN: Duration = Duration::from_millis(50);
 const MAX_FRAME_SIZE: usize = 1024 * 1024;
 
+type Payload = Arc<[u8]>;
+
 #[derive(Debug)]
 struct Cli {
     cols: u16,
@@ -56,8 +58,8 @@ enum ClientMessage {
 
 #[derive(Debug, Clone)]
 enum ServerMessage {
-    Snapshot(Vec<u8>),
-    Output(Vec<u8>),
+    Snapshot(Payload),
+    Output(Payload),
     Detached,
     Close,
     Exit(i32),
@@ -282,7 +284,7 @@ fn server(socket: &Path, rows: u16, cols: u16, command: &[String]) -> Result<()>
                         if let Ok(mut parser) = screen.lock() {
                             parser.process(&buf[..n]);
                         }
-                        broadcast(&clients, ServerMessage::Output(buf[..n].to_vec()));
+                        broadcast(&clients, ServerMessage::Output(Payload::from(&buf[..n])));
                     }
                     Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                     Err(_) => break,
@@ -396,11 +398,11 @@ fn handle_client(
     Ok(())
 }
 
-fn snapshot(screen: &Mutex<vt100::Parser>) -> Result<Vec<u8>> {
+fn snapshot(screen: &Mutex<vt100::Parser>) -> Result<Payload> {
     let parser = screen.lock().map_err(|_| anyhow!("screen lock poisoned"))?;
     let mut bytes = Vec::from(SNAPSHOT_PREFIX);
     bytes.extend_from_slice(&parser.screen().contents_formatted());
-    Ok(bytes)
+    Ok(Payload::from(bytes))
 }
 
 fn broadcast(clients: &Mutex<Vec<mpsc::Sender<ServerMessage>>>, message: ServerMessage) {
@@ -524,11 +526,11 @@ fn write_server_frame(writer: &mut impl Write, value: &ServerMessage) -> Result<
     match value {
         ServerMessage::Snapshot(bytes) => {
             body.push(1);
-            body.extend_from_slice(bytes);
+            body.extend_from_slice(bytes.as_ref());
         }
         ServerMessage::Output(bytes) => {
             body.push(2);
-            body.extend_from_slice(bytes);
+            body.extend_from_slice(bytes.as_ref());
         }
         ServerMessage::Detached => body.push(3),
         ServerMessage::Close => body.push(4),
@@ -569,8 +571,8 @@ fn read_server_frame(reader: &mut impl Read) -> Result<ServerMessage> {
     let body = read_frame_body(reader)?;
     let (&tag, payload) = body.split_first().context("empty server frame")?;
     match tag {
-        1 => Ok(ServerMessage::Snapshot(payload.to_vec())),
-        2 => Ok(ServerMessage::Output(payload.to_vec())),
+        1 => Ok(ServerMessage::Snapshot(Payload::from(payload))),
+        2 => Ok(ServerMessage::Output(Payload::from(payload))),
         3 if payload.is_empty() => Ok(ServerMessage::Detached),
         4 if payload.is_empty() => Ok(ServerMessage::Close),
         5 if payload.len() == 4 => Ok(ServerMessage::Exit(i32::from_be_bytes([
