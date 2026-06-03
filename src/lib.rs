@@ -23,6 +23,52 @@ const MAX_FRAME_SIZE: usize = 1024 * 1024;
 
 type Payload = Arc<[u8]>;
 
+struct RetainedScreen {
+    parser: vt100::Parser,
+    rows: u16,
+    cols: u16,
+    cached_snapshot: Option<Payload>,
+}
+
+impl RetainedScreen {
+    fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            parser: vt100::Parser::new(rows, cols, 0),
+            rows,
+            cols,
+            cached_snapshot: None,
+        }
+    }
+
+    fn process(&mut self, bytes: &[u8]) {
+        self.parser.process(bytes);
+        self.cached_snapshot = None;
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) -> bool {
+        if self.rows == rows && self.cols == cols {
+            return false;
+        }
+        self.parser.set_size(rows, cols);
+        self.rows = rows;
+        self.cols = cols;
+        self.cached_snapshot = None;
+        true
+    }
+
+    fn snapshot(&mut self) -> Payload {
+        if let Some(snapshot) = &self.cached_snapshot {
+            return Arc::clone(snapshot);
+        }
+
+        let mut bytes = Vec::from(SNAPSHOT_PREFIX);
+        bytes.extend_from_slice(&self.parser.screen().contents_formatted());
+        let snapshot = Payload::from(bytes);
+        self.cached_snapshot = Some(Arc::clone(&snapshot));
+        snapshot
+    }
+}
+
 #[derive(Debug)]
 struct Cli {
     cols: u16,
@@ -270,7 +316,7 @@ fn server(socket: &Path, rows: u16, cols: u16, command: &[String]) -> Result<()>
     ));
 
     let clients: Arc<Mutex<Vec<mpsc::Sender<ServerMessage>>>> = Arc::new(Mutex::new(Vec::new()));
-    let screen = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+    let screen = Arc::new(Mutex::new(RetainedScreen::new(rows, cols)));
 
     {
         let clients = Arc::clone(&clients);
@@ -281,8 +327,8 @@ fn server(socket: &Path, rows: u16, cols: u16, command: &[String]) -> Result<()>
                 match pty_reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if let Ok(mut parser) = screen.lock() {
-                            parser.process(&buf[..n]);
+                        if let Ok(mut screen) = screen.lock() {
+                            screen.process(&buf[..n]);
                         }
                         broadcast(&clients, ServerMessage::Output(Payload::from(&buf[..n])));
                     }
@@ -328,7 +374,7 @@ fn server(socket: &Path, rows: u16, cols: u16, command: &[String]) -> Result<()>
 
 fn handle_client(
     stream: UnixStream,
-    screen: Arc<Mutex<vt100::Parser>>,
+    screen: Arc<Mutex<RetainedScreen>>,
     clients: Arc<Mutex<Vec<mpsc::Sender<ServerMessage>>>>,
     pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
@@ -369,19 +415,22 @@ fn handle_client(
                 writer.flush().context("flush pty input")?;
             }
             Ok(ClientMessage::Resize { rows, cols }) => {
-                if let Ok(mut parser) = screen.lock() {
-                    parser.set_size(rows, cols);
-                }
-                master
+                let resized = screen
                     .lock()
-                    .map_err(|_| anyhow!("pty lock poisoned"))?
-                    .resize(PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    })
-                    .context("resize pty")?;
+                    .map(|mut screen| screen.resize(rows, cols))
+                    .unwrap_or(true);
+                if resized {
+                    master
+                        .lock()
+                        .map_err(|_| anyhow!("pty lock poisoned"))?
+                        .resize(PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        })
+                        .context("resize pty")?;
+                }
             }
             Ok(ClientMessage::Detach) => {
                 let _ = tx.send(ServerMessage::Detached);
@@ -398,11 +447,11 @@ fn handle_client(
     Ok(())
 }
 
-fn snapshot(screen: &Mutex<vt100::Parser>) -> Result<Payload> {
-    let parser = screen.lock().map_err(|_| anyhow!("screen lock poisoned"))?;
-    let mut bytes = Vec::from(SNAPSHOT_PREFIX);
-    bytes.extend_from_slice(&parser.screen().contents_formatted());
-    Ok(Payload::from(bytes))
+fn snapshot(screen: &Mutex<RetainedScreen>) -> Result<Payload> {
+    Ok(screen
+        .lock()
+        .map_err(|_| anyhow!("screen lock poisoned"))?
+        .snapshot())
 }
 
 fn broadcast(clients: &Mutex<Vec<mpsc::Sender<ServerMessage>>>, message: ServerMessage) {
@@ -505,50 +554,37 @@ fn read_server_output(stream: &mut UnixStream) -> Result<OutputResult> {
 }
 
 fn write_client_frame(writer: &mut impl Write, value: &ClientMessage) -> Result<()> {
-    let mut body = Vec::new();
     match value {
-        ClientMessage::Input(bytes) => {
-            body.push(1);
-            body.extend_from_slice(bytes);
-        }
+        ClientMessage::Input(bytes) => write_frame(writer, 1, bytes),
         ClientMessage::Resize { rows, cols } => {
-            body.push(2);
-            body.extend_from_slice(&rows.to_be_bytes());
-            body.extend_from_slice(&cols.to_be_bytes());
+            let mut payload = [0; 4];
+            payload[..2].copy_from_slice(&rows.to_be_bytes());
+            payload[2..].copy_from_slice(&cols.to_be_bytes());
+            write_frame(writer, 2, &payload)
         }
-        ClientMessage::Detach => body.push(3),
+        ClientMessage::Detach => write_frame(writer, 3, &[]),
     }
-    write_frame_body(writer, &body)
 }
 
 fn write_server_frame(writer: &mut impl Write, value: &ServerMessage) -> Result<()> {
-    let mut body = Vec::new();
     match value {
-        ServerMessage::Snapshot(bytes) => {
-            body.push(1);
-            body.extend_from_slice(bytes.as_ref());
-        }
-        ServerMessage::Output(bytes) => {
-            body.push(2);
-            body.extend_from_slice(bytes.as_ref());
-        }
-        ServerMessage::Detached => body.push(3),
-        ServerMessage::Close => body.push(4),
-        ServerMessage::Exit(code) => {
-            body.push(5);
-            body.extend_from_slice(&code.to_be_bytes());
-        }
+        ServerMessage::Snapshot(bytes) => write_frame(writer, 1, bytes.as_ref()),
+        ServerMessage::Output(bytes) => write_frame(writer, 2, bytes.as_ref()),
+        ServerMessage::Detached => write_frame(writer, 3, &[]),
+        ServerMessage::Close => write_frame(writer, 4, &[]),
+        ServerMessage::Exit(code) => write_frame(writer, 5, &code.to_be_bytes()),
     }
-    write_frame_body(writer, &body)
 }
 
-fn write_frame_body(writer: &mut impl Write, body: &[u8]) -> Result<()> {
-    if body.len() > MAX_FRAME_SIZE {
+fn write_frame(writer: &mut impl Write, tag: u8, payload: &[u8]) -> Result<()> {
+    let body_len = payload.len().checked_add(1).context("frame too large")?;
+    if body_len > MAX_FRAME_SIZE {
         bail!("frame too large");
     }
-    let len = u32::try_from(body.len()).context("frame too large")?;
+    let len = u32::try_from(body_len).context("frame too large")?;
     writer.write_all(&len.to_be_bytes())?;
-    writer.write_all(body)?;
+    writer.write_all(&[tag])?;
+    writer.write_all(payload)?;
     writer.flush()?;
     Ok(())
 }
