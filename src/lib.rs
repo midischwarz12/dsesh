@@ -12,59 +12,48 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use serde::{Deserialize, Serialize};
 
 const DETACH: u8 = 0x1c; // Ctrl-\
 const SNAPSHOT_PREFIX: &[u8] = b"\x1b[?1049l\x1b[2J\x1b[H";
 const SERVER_THREAD_STACK: usize = 256 * 1024;
 const EXIT_DRAIN: Duration = Duration::from_millis(50);
 
-#[derive(Debug, Parser)]
-#[command(version, about)]
+#[derive(Debug)]
 struct Cli {
-    #[arg(long, default_value_t = 80)]
     cols: u16,
-    #[arg(long, default_value_t = 24)]
     rows: u16,
-    #[command(subcommand)]
     command: Commands,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug)]
 enum Commands {
-    /// Start a new session and attach to it.
     New {
         socket: PathBuf,
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
-    /// Attach to an existing session.
-    Attach { socket: PathBuf },
-    /// Attach to an existing socket, or start a new session first.
+    Attach {
+        socket: PathBuf,
+    },
     Run {
         socket: PathBuf,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
-    #[command(hide = true)]
     Server {
         socket: PathBuf,
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 enum ClientMessage {
     Input(Vec<u8>),
     Resize { rows: u16, cols: u16 },
     Detach,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 enum ServerMessage {
     Snapshot(Vec<u8>),
     Output(Vec<u8>),
@@ -74,7 +63,7 @@ enum ServerMessage {
 }
 
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = parse_cli(std::env::args().skip(1))?;
     match cli.command {
         Commands::New { socket, command } => {
             start_server(&socket, cli.rows, cli.cols, &command)?;
@@ -89,6 +78,112 @@ pub fn run() -> Result<()> {
         }
         Commands::Server { socket, command } => server(&socket, cli.rows, cli.cols, &command),
     }
+}
+
+fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
+    let mut args = args.into_iter().peekable();
+    let mut rows = 24;
+    let mut cols = 80;
+
+    while let Some(arg) = args.peek() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                println!("dsesh {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "--rows" => {
+                args.next();
+                rows = parse_dimension(args.next(), "--rows")?;
+            }
+            "--cols" => {
+                args.next();
+                cols = parse_dimension(args.next(), "--cols")?;
+            }
+            _ => break,
+        }
+    }
+
+    let subcommand = args.next().context("missing command")?;
+    let command = match subcommand.as_str() {
+        "new" => {
+            let socket = next_path(&mut args, "new requires a socket path")?;
+            let command = command_args(args);
+            if command.is_empty() {
+                bail!("new requires a command after --");
+            }
+            Commands::New { socket, command }
+        }
+        "attach" => {
+            let socket = next_path(&mut args, "attach requires a socket path")?;
+            ensure_no_extra(args)?;
+            Commands::Attach { socket }
+        }
+        "run" => {
+            let socket = next_path(&mut args, "run requires a socket path")?;
+            let command = command_args(args);
+            Commands::Run { socket, command }
+        }
+        "server" => {
+            let socket = next_path(&mut args, "server requires a socket path")?;
+            let command = command_args(args);
+            if command.is_empty() {
+                bail!("server requires a command after --");
+            }
+            Commands::Server { socket, command }
+        }
+        other => bail!("unknown command: {other}"),
+    };
+
+    Ok(Cli {
+        cols,
+        rows,
+        command,
+    })
+}
+
+fn parse_dimension(value: Option<String>, flag: &str) -> Result<u16> {
+    value
+        .with_context(|| format!("{flag} requires a value"))?
+        .parse()
+        .with_context(|| format!("invalid {flag} value"))
+}
+
+fn next_path(args: &mut impl Iterator<Item = String>, message: &str) -> Result<PathBuf> {
+    args.next().map(PathBuf::from).context(message.to_owned())
+}
+
+fn command_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut args: Vec<String> = args.into_iter().collect();
+    if args.first().is_some_and(|arg| arg == "--") {
+        args.remove(0);
+    }
+    args
+}
+
+fn ensure_no_extra(mut args: impl Iterator<Item = String>) -> Result<()> {
+    if let Some(arg) = args.next() {
+        bail!("unexpected argument: {arg}");
+    }
+    Ok(())
+}
+
+fn print_help() {
+    println!(
+        "Usage: dsesh [OPTIONS] <COMMAND>\n\n\
+Commands:\n  \
+new <SOCKET> -- <COMMAND> [ARGS...]\n  \
+attach <SOCKET>\n  \
+run <SOCKET> [-- <COMMAND> [ARGS...]]\n\n\
+Options:\n  \
+--cols <COLS>  Fallback terminal width [default: 80]\n  \
+--rows <ROWS>  Fallback terminal height [default: 24]\n  \
+-h, --help     Print help\n  \
+-V, --version  Print version"
+    );
 }
 
 fn start_server(socket: &Path, rows: u16, cols: u16, command: &[String]) -> Result<()> {
@@ -250,7 +345,7 @@ fn handle_client(
             if matches!(message, ServerMessage::Close) {
                 break;
             }
-            if write_frame(&mut writer_stream, &message).is_err() {
+            if write_server_frame(&mut writer_stream, &message).is_err() {
                 break;
             }
             if matches!(message, ServerMessage::Detached | ServerMessage::Exit(_)) {
@@ -262,7 +357,7 @@ fn handle_client(
 
     let mut reader_stream = stream;
     loop {
-        match read_frame::<ClientMessage>(&mut reader_stream) {
+        match read_client_frame(&mut reader_stream) {
             Ok(ClientMessage::Input(bytes)) => {
                 let mut writer = pty_writer
                     .lock()
@@ -328,7 +423,7 @@ fn attach(socket: &Path, fallback_rows: u16, fallback_cols: u16) -> Result<()> {
     let mut stream =
         UnixStream::connect(socket).with_context(|| format!("connect {}", socket.display()))?;
     let (cols, rows) = size().unwrap_or((fallback_cols, fallback_rows));
-    write_frame(&mut stream, &ClientMessage::Resize { rows, cols })?;
+    write_client_frame(&mut stream, &ClientMessage::Resize { rows, cols })?;
 
     let raw = io::stdin().is_terminal() && io::stdout().is_terminal();
     let guard = if raw { Some(RawMode::enter()?) } else { None };
@@ -344,17 +439,20 @@ fn attach(socket: &Path, fallback_rows: u16, fallback_cols: u16) -> Result<()> {
                 Ok(n) => {
                     if let Some(pos) = buf[..n].iter().position(|byte| *byte == DETACH) {
                         if pos > 0 {
-                            let _ = write_frame(
+                            let _ = write_client_frame(
                                 &mut input_stream,
                                 &ClientMessage::Input(buf[..pos].to_vec()),
                             );
                         }
-                        let _ = write_frame(&mut input_stream, &ClientMessage::Detach);
+                        let _ = write_client_frame(&mut input_stream, &ClientMessage::Detach);
                         let _ = detach_tx.send(());
                         break;
                     }
-                    if write_frame(&mut input_stream, &ClientMessage::Input(buf[..n].to_vec()))
-                        .is_err()
+                    if write_client_frame(
+                        &mut input_stream,
+                        &ClientMessage::Input(buf[..n].to_vec()),
+                    )
+                    .is_err()
                     {
                         break;
                     }
@@ -390,7 +488,7 @@ enum OutputResult {
 fn read_server_output(stream: &mut UnixStream) -> Result<OutputResult> {
     let mut stdout = io::stdout().lock();
     loop {
-        match read_frame::<ServerMessage>(stream) {
+        match read_server_frame(stream) {
             Ok(ServerMessage::Snapshot(bytes) | ServerMessage::Output(bytes)) => {
                 stdout.write_all(&bytes)?;
                 stdout.flush()?;
@@ -403,22 +501,88 @@ fn read_server_output(stream: &mut UnixStream) -> Result<OutputResult> {
     }
 }
 
-fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<()> {
-    let body = serde_json::to_vec(value).context("serialize frame")?;
+fn write_client_frame(writer: &mut impl Write, value: &ClientMessage) -> Result<()> {
+    let mut body = Vec::new();
+    match value {
+        ClientMessage::Input(bytes) => {
+            body.push(1);
+            body.extend_from_slice(bytes);
+        }
+        ClientMessage::Resize { rows, cols } => {
+            body.push(2);
+            body.extend_from_slice(&rows.to_be_bytes());
+            body.extend_from_slice(&cols.to_be_bytes());
+        }
+        ClientMessage::Detach => body.push(3),
+    }
+    write_frame_body(writer, &body)
+}
+
+fn write_server_frame(writer: &mut impl Write, value: &ServerMessage) -> Result<()> {
+    let mut body = Vec::new();
+    match value {
+        ServerMessage::Snapshot(bytes) => {
+            body.push(1);
+            body.extend_from_slice(bytes);
+        }
+        ServerMessage::Output(bytes) => {
+            body.push(2);
+            body.extend_from_slice(bytes);
+        }
+        ServerMessage::Detached => body.push(3),
+        ServerMessage::Close => body.push(4),
+        ServerMessage::Exit(code) => {
+            body.push(5);
+            body.extend_from_slice(&code.to_be_bytes());
+        }
+    }
+    write_frame_body(writer, &body)
+}
+
+fn write_frame_body(writer: &mut impl Write, body: &[u8]) -> Result<()> {
     let len = u32::try_from(body.len()).context("frame too large")?;
     writer.write_all(&len.to_be_bytes())?;
-    writer.write_all(&body)?;
+    writer.write_all(body)?;
     writer.flush()?;
     Ok(())
 }
 
-fn read_frame<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> Result<T> {
+fn read_client_frame(reader: &mut impl Read) -> Result<ClientMessage> {
+    let body = read_frame_body(reader)?;
+    let (&tag, payload) = body.split_first().context("empty client frame")?;
+    match tag {
+        1 => Ok(ClientMessage::Input(payload.to_vec())),
+        2 if payload.len() == 4 => Ok(ClientMessage::Resize {
+            rows: u16::from_be_bytes([payload[0], payload[1]]),
+            cols: u16::from_be_bytes([payload[2], payload[3]]),
+        }),
+        3 if payload.is_empty() => Ok(ClientMessage::Detach),
+        _ => bail!("invalid client frame"),
+    }
+}
+
+fn read_server_frame(reader: &mut impl Read) -> Result<ServerMessage> {
+    let body = read_frame_body(reader)?;
+    let (&tag, payload) = body.split_first().context("empty server frame")?;
+    match tag {
+        1 => Ok(ServerMessage::Snapshot(payload.to_vec())),
+        2 => Ok(ServerMessage::Output(payload.to_vec())),
+        3 if payload.is_empty() => Ok(ServerMessage::Detached),
+        4 if payload.is_empty() => Ok(ServerMessage::Close),
+        5 if payload.len() == 4 => Ok(ServerMessage::Exit(i32::from_be_bytes([
+            payload[0], payload[1], payload[2], payload[3],
+        ]))),
+        _ => bail!("invalid server frame"),
+    }
+}
+
+fn read_frame_body(reader: &mut impl Read) -> Result<Vec<u8>> {
     let mut len = [0; 4];
     reader.read_exact(&mut len).context("read frame length")?;
     let len = u32::from_be_bytes(len) as usize;
     let mut body = vec![0; len];
     reader.read_exact(&mut body).context("read frame body")?;
-    serde_json::from_slice(&body).context("decode frame")
+    Ok(body)
 }
 
 struct RawMode;
