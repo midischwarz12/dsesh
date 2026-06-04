@@ -95,13 +95,6 @@ enum Commands {
     },
 }
 
-#[derive(Debug)]
-enum ClientMessage {
-    Input(Vec<u8>),
-    Resize { rows: u16, cols: u16 },
-    Detach,
-}
-
 #[derive(Debug, Clone)]
 enum ServerMessage {
     Snapshot(Payload),
@@ -406,15 +399,23 @@ fn handle_client(
 
     let mut reader_stream = stream;
     loop {
-        match read_client_frame(&mut reader_stream) {
-            Ok(ClientMessage::Input(bytes)) => {
+        match read_frame_header(&mut reader_stream) {
+            Ok(FrameHeader {
+                tag: 1,
+                payload_len,
+            }) => {
                 let mut writer = pty_writer
                     .lock()
                     .map_err(|_| anyhow!("pty writer lock poisoned"))?;
-                writer.write_all(&bytes).context("write input to pty")?;
+                copy_exact(&mut reader_stream, writer.as_mut(), payload_len)
+                    .context("write input to pty")?;
                 writer.flush().context("flush pty input")?;
             }
-            Ok(ClientMessage::Resize { rows, cols }) => {
+            Ok(FrameHeader {
+                tag: 2,
+                payload_len: 4,
+            }) => {
+                let (rows, cols) = read_client_resize_payload(&mut reader_stream)?;
                 let resized = screen
                     .lock()
                     .map(|mut screen| screen.resize(rows, cols))
@@ -432,8 +433,15 @@ fn handle_client(
                         .context("resize pty")?;
                 }
             }
-            Ok(ClientMessage::Detach) => {
+            Ok(FrameHeader {
+                tag: 3,
+                payload_len: 0,
+            }) => {
                 let _ = tx.send(ServerMessage::Detached);
+                break;
+            }
+            Ok(_) => {
+                let _ = tx.send(ServerMessage::Close);
                 break;
             }
             Err(_) => {
@@ -537,7 +545,9 @@ fn read_server_output(stream: &mut UnixStream) -> Result<OutputResult> {
                 tag: 1 | 2,
                 payload_len,
             }) => {
-                copy_exact(stream, &mut stdout, payload_len)?;
+                if copy_exact(stream, &mut stdout, payload_len).is_err() {
+                    return Ok(OutputResult::Disconnected);
+                }
                 stdout.flush()?;
             }
             Ok(FrameHeader {
@@ -600,26 +610,15 @@ fn write_frame(writer: &mut impl Write, tag: u8, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn read_client_frame(reader: &mut impl Read) -> Result<ClientMessage> {
-    let header = read_frame_header(reader)?;
-    match header.tag {
-        1 => Ok(ClientMessage::Input(read_payload(
-            reader,
-            header.payload_len,
-        )?)),
-        2 if header.payload_len == 4 => {
-            let mut payload = [0; 4];
-            reader
-                .read_exact(&mut payload)
-                .context("read resize payload")?;
-            Ok(ClientMessage::Resize {
-                rows: u16::from_be_bytes([payload[0], payload[1]]),
-                cols: u16::from_be_bytes([payload[2], payload[3]]),
-            })
-        }
-        3 if header.payload_len == 0 => Ok(ClientMessage::Detach),
-        _ => bail!("invalid client frame"),
-    }
+fn read_client_resize_payload(reader: &mut impl Read) -> Result<(u16, u16)> {
+    let mut payload = [0; 4];
+    reader
+        .read_exact(&mut payload)
+        .context("read resize payload")?;
+    Ok((
+        u16::from_be_bytes([payload[0], payload[1]]),
+        u16::from_be_bytes([payload[2], payload[3]]),
+    ))
 }
 
 struct FrameHeader {
@@ -642,15 +641,11 @@ fn read_frame_header(reader: &mut impl Read) -> Result<FrameHeader> {
     })
 }
 
-fn read_payload(reader: &mut impl Read, len: usize) -> Result<Vec<u8>> {
-    let mut payload = vec![0; len];
-    reader
-        .read_exact(&mut payload)
-        .context("read frame payload")?;
-    Ok(payload)
-}
-
-fn copy_exact(reader: &mut impl Read, writer: &mut impl Write, mut len: usize) -> Result<()> {
+fn copy_exact(
+    reader: &mut impl Read,
+    writer: &mut (impl Write + ?Sized),
+    mut len: usize,
+) -> Result<()> {
     let mut buf = [0; 8192];
     while len > 0 {
         let chunk = len.min(buf.len());
