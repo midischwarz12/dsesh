@@ -523,7 +523,7 @@ fn attach(socket: &Path, fallback_rows: u16, fallback_cols: u16) -> Result<()> {
     drop(guard);
 
     if detached || matches!(output, OutputResult::Detached) {
-        println!("[detached]");
+        println!("[detached] {}", socket.display());
     } else if matches!(output, OutputResult::Exit(_)) {
         println!("[EOF - ended session]");
     }
