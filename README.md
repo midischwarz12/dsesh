@@ -25,7 +25,7 @@ bars, plugins, or persistent session registries.
 Start a new session:
 
 ```sh
-dsesh new /tmp/editor.dsesh -- nvim
+dsesh new /tmp/editor.sock -- nvim
 ```
 
 Detach with `Ctrl-\`. The child process keeps running.
@@ -33,19 +33,19 @@ Detach with `Ctrl-\`. The child process keeps running.
 Attach later:
 
 ```sh
-dsesh attach /tmp/editor.dsesh
+dsesh attach /tmp/editor.sock
 ```
 
 Use `run` for dtach-like "attach if it exists, otherwise create it":
 
 ```sh
-dsesh run /tmp/shell.dsesh -- "$SHELL"
+dsesh run /tmp/shell.sock -- "$SHELL"
 ```
 
 When the socket already exists, `run` does not need a command:
 
 ```sh
-dsesh run /tmp/shell.dsesh
+dsesh run /tmp/shell.sock
 ```
 
 `dsesh` prints `[detached]` after a client detaches and
@@ -66,6 +66,8 @@ the client receives live PTY bytes.
 
 The socket path is the session identity. Removing the socket while the server is
 running makes the session unreachable, like other socket-file based tools.
+Examples use `.sock` because the path is a Unix domain socket, not a saved
+session data file.
 
 ## CLI
 
