@@ -57,7 +57,7 @@ nix run .#dr -- "$SHELL"
 nix run .#dr -- sh -c 'command1; command2 | command3'
 ```
 
-`dsesh` prints `[detached] SOCKET` after a client detaches and
+`dsesh` prints `[detached - SOCKET]` after a client detaches and
 `[EOF - ended session]` when the child process exits or is terminated.
 
 ## Model

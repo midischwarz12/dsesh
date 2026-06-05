@@ -35,14 +35,14 @@ cargo build --quiet --bin dsesh
 
 printf '\034' | "$bin" new "$sock" -- sh -c 'printf "retained-screen-ok\n"; sleep 1' >"$first"
 
-if ! grep -q '\[detached\]' "$first"; then
+if ! grep -q '\[detached - ' "$first"; then
   echo "detached client did not print detach marker" >&2
   echo "--- detach output ---" >&2
   sed -n '1,120p' "$first" >&2
   exit 1
 fi
 
-if ! grep -Fq "[detached] $sock" "$first"; then
+if ! grep -Fq "[detached - $sock]" "$first"; then
   echo "detached client did not print socket path" >&2
   echo "--- detach output ---" >&2
   sed -n '1,120p' "$first" >&2
@@ -214,14 +214,14 @@ if grep -q 'STALE-BEFORE-CLEAR' "$alt_second"; then
   exit 1
 fi
 
-if ! grep -q '\[detached\]' "$alt_second"; then
+if ! grep -q '\[detached - ' "$alt_second"; then
   echo "alternate-screen reattach did not detach cleanly" >&2
   echo "--- alternate reattach output ---" >&2
   sed -n '1,160p' "$alt_second" >&2
   exit 1
 fi
 
-if ! grep -Fq "[detached] $alt_sock" "$alt_second"; then
+if ! grep -Fq "[detached - $alt_sock]" "$alt_second"; then
   echo "alternate-screen reattach did not print socket path" >&2
   echo "--- alternate reattach output ---" >&2
   sed -n '1,160p' "$alt_second" >&2
