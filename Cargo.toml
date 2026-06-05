@@ -12,7 +12,6 @@ repository = "https://github.com/midischwarz12/dsesh"
 [dependencies]
 anyhow = "1.0.86"
 libc = "0.2.186"
-portable-pty = "0.8.1"
 vt100 = "0.15.2"
 
 [dev-dependencies]

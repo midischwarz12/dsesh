@@ -2,19 +2,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::AsRawFd;
+use std::os::unix::io::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 const DETACH: u8 = 0x1c; // Ctrl-\
 const SNAPSHOT_PREFIX: &[u8] = b"\x1b[?1049l\x1b[2J\x1b[H";
@@ -270,6 +271,124 @@ fn wait_for_socket(socket: &Path, timeout: Duration) -> Result<()> {
     bail!("timed out waiting for server socket: {}", socket.display())
 }
 
+struct Pty {
+    master: File,
+    slave: File,
+}
+
+struct PtyReader(File);
+
+impl Read for PtyReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.0.read(buf) {
+            Err(err) if err.raw_os_error() == Some(libc::EIO) => Ok(0),
+            result => result,
+        }
+    }
+}
+
+fn open_pty(rows: u16, cols: u16) -> Result<Pty> {
+    let mut master = -1;
+    let mut slave = -1;
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+
+    let result = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &size,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error()).context("openpty");
+    }
+
+    set_cloexec(master).context("set master close-on-exec")?;
+    set_cloexec(slave).context("set slave close-on-exec")?;
+
+    Ok(Pty {
+        master: unsafe { File::from_raw_fd(master) },
+        slave: unsafe { File::from_raw_fd(slave) },
+    })
+}
+
+fn spawn_pty_command(slave: &File, command: &[String]) -> Result<Child> {
+    let mut child = Command::new(&command[0]);
+    child.args(&command[1..]);
+    child.current_dir(std::env::current_dir().context("resolve server current directory")?);
+    child.stdin(Stdio::from(slave.try_clone().context("clone pty stdin")?));
+    child.stdout(Stdio::from(slave.try_clone().context("clone pty stdout")?));
+    child.stderr(Stdio::from(slave.try_clone().context("clone pty stderr")?));
+
+    unsafe {
+        child.pre_exec(|| {
+            for signal in [
+                libc::SIGCHLD,
+                libc::SIGHUP,
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTERM,
+                libc::SIGALRM,
+            ] {
+                libc::signal(signal, libc::SIG_DFL);
+            }
+
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+
+            Ok(())
+        });
+    }
+
+    child.spawn().context("spawn pty child")
+}
+
+fn resize_pty(master: &File, rows: u16, cols: u16) -> io::Result<()> {
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let result = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn set_cloexec(fd: i32) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1)
+}
+
 fn server(socket: &Path, rows: u16, cols: u16, command: &[String]) -> Result<()> {
     if command.is_empty() {
         bail!("missing command");
@@ -282,34 +401,22 @@ fn server(socket: &Path, rows: u16, cols: u16, command: &[String]) -> Result<()>
         fs::remove_file(socket).with_context(|| format!("remove stale {}", socket.display()))?;
     }
 
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .context("open pty")?;
+    let pty = open_pty(rows, cols).context("open pty")?;
+    let mut child = spawn_pty_command(&pty.slave, command).context("spawn command")?;
 
-    let mut builder = CommandBuilder::new(&command[0]);
-    builder.args(&command[1..]);
-    builder.cwd(std::env::current_dir().context("resolve server current directory")?);
-    let mut child = pair.slave.spawn_command(builder).context("spawn command")?;
-    drop(pair.slave);
-
-    let master = Arc::new(Mutex::new(pair.master));
+    let master = Arc::new(Mutex::new(pty.master));
     let mut pty_reader = master
         .lock()
         .map_err(|_| anyhow!("pty lock poisoned"))?
-        .try_clone_reader()
+        .try_clone()
+        .map(PtyReader)
         .context("clone pty reader")?;
     let pty_writer = Arc::new(Mutex::new(
         master
             .lock()
             .map_err(|_| anyhow!("pty lock poisoned"))?
-            .take_writer()
-            .context("take pty writer")?,
+            .try_clone()
+            .context("clone pty writer")?,
     ));
 
     let clients: Arc<Mutex<Vec<mpsc::Sender<ServerMessage>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -344,7 +451,7 @@ fn server(socket: &Path, rows: u16, cols: u16, command: &[String]) -> Result<()>
 
     loop {
         if let Some(status) = child.try_wait().context("poll child process")? {
-            let code = status.exit_code().min(i32::MAX as u32) as i32;
+            let code = exit_code(status);
             broadcast(&clients, ServerMessage::Exit(code));
             let _ = fs::remove_file(socket);
             thread::sleep(EXIT_DRAIN);
@@ -373,8 +480,8 @@ fn handle_client(
     stream: UnixStream,
     screen: Arc<Mutex<RetainedScreen>>,
     clients: Arc<Mutex<Vec<mpsc::Sender<ServerMessage>>>>,
-    pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    pty_writer: Arc<Mutex<File>>,
+    master: Arc<Mutex<File>>,
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     clients
@@ -411,7 +518,7 @@ fn handle_client(
                 let mut writer = pty_writer
                     .lock()
                     .map_err(|_| anyhow!("pty writer lock poisoned"))?;
-                copy_exact(&mut reader_stream, writer.as_mut(), payload_len)
+                copy_exact(&mut reader_stream, &mut *writer, payload_len)
                     .context("write input to pty")?;
                 writer.flush().context("flush pty input")?;
             }
@@ -425,16 +532,8 @@ fn handle_client(
                     .map(|mut screen| screen.resize(rows, cols))
                     .unwrap_or(true);
                 if resized {
-                    master
-                        .lock()
-                        .map_err(|_| anyhow!("pty lock poisoned"))?
-                        .resize(PtySize {
-                            rows,
-                            cols,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        })
-                        .context("resize pty")?;
+                    let master = master.lock().map_err(|_| anyhow!("pty lock poisoned"))?;
+                    resize_pty(&master, rows, cols).context("resize pty")?;
                 }
             }
             Ok(FrameHeader {
