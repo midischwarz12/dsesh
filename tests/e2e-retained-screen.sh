@@ -18,6 +18,7 @@ sig_sock="$tmpdir/signalled.sock"
 thread_sock="$tmpdir/thread-regression.sock"
 alt_sock="$tmpdir/alternate-screen.sock"
 cwd_sock="$tmpdir/cwd-session.sock"
+closed_stdout_sock="$tmpdir/closed-stdout.sock"
 first="$tmpdir/first.out"
 second="$tmpdir/second.out"
 signalled="$tmpdir/signalled.out"
@@ -96,6 +97,16 @@ if ! grep -q "cwd:$cwd_dir" "$cwd_marker"; then
   sed -n '1,120p' "$cwd_out" >&2
   echo "--- cwd marker ---" >&2
   sed -n '1,120p' "$cwd_marker" >&2 || true
+  exit 1
+fi
+
+set +e
+printf '\034' | "$bin" new "$closed_stdout_sock" -- sh -c 'sleep 1' | head -n0
+closed_stdout_status=$?
+set -e
+
+if [ "$closed_stdout_status" -ne 0 ]; then
+  echo "closed stdout detach path exited unsuccessfully: $closed_stdout_status" >&2
   exit 1
 fi
 

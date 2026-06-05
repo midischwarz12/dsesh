@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 midischwarz12
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::fmt;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::Shutdown;
@@ -134,7 +135,7 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                println!("dsesh {}", env!("CARGO_PKG_VERSION"));
+                let _ = write_stdout_line(format_args!("dsesh {}", env!("CARGO_PKG_VERSION")));
                 std::process::exit(0);
             }
             "--rows" => {
@@ -214,7 +215,7 @@ fn ensure_no_extra(mut args: impl Iterator<Item = String>) -> Result<()> {
 }
 
 fn print_help() {
-    println!(
+    let _ = write_stdout_line(format_args!(
         "Usage: dsesh [OPTIONS] <COMMAND>\n\n\
 Commands:\n  \
 new <SOCKET> -- <COMMAND> [ARGS...]\n  \
@@ -225,7 +226,7 @@ Options:\n  \
 --rows <ROWS>  Fallback terminal height [default: 24]\n  \
 -h, --help     Print help\n  \
 -V, --version  Print version"
-    );
+    ));
 }
 
 fn start_server(socket: &Path, rows: u16, cols: u16, command: &[String]) -> Result<()> {
@@ -523,9 +524,9 @@ fn attach(socket: &Path, fallback_rows: u16, fallback_cols: u16) -> Result<()> {
     drop(guard);
 
     if detached || matches!(output, OutputResult::Detached) {
-        println!("[detached - {}]", socket.display());
+        write_stdout_line(format_args!("[detached - {}]", socket.display()))?;
     } else if matches!(output, OutputResult::Exit(_)) {
-        println!("[EOF - ended session]");
+        write_stdout_line(format_args!("[EOF - ended session]"))?;
     }
 
     match output {
@@ -551,7 +552,9 @@ fn read_server_output(stream: &mut UnixStream) -> Result<OutputResult> {
                 if copy_exact(stream, &mut stdout, payload_len).is_err() {
                     return Ok(OutputResult::Disconnected);
                 }
-                stdout.flush()?;
+                if stdout.flush().is_err() {
+                    return Ok(OutputResult::Disconnected);
+                }
             }
             Ok(FrameHeader {
                 tag: 3,
@@ -577,6 +580,23 @@ fn read_server_output(stream: &mut UnixStream) -> Result<OutputResult> {
 
 fn write_client_input_frame(writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
     write_frame(writer, 1, bytes)
+}
+
+fn write_stdout_line(args: fmt::Arguments<'_>) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout
+        .write_fmt(args)
+        .and_then(|()| stdout.write_all(b"\n"))
+        .or_else(ignore_broken_pipe)
+        .context("write stdout")
+}
+
+fn ignore_broken_pipe(err: io::Error) -> io::Result<()> {
+    if err.kind() == io::ErrorKind::BrokenPipe {
+        Ok(())
+    } else {
+        Err(err)
+    }
 }
 
 fn write_client_resize_frame(writer: &mut impl Write, rows: u16, cols: u16) -> Result<()> {
