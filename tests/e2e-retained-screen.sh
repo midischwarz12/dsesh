@@ -17,6 +17,7 @@ sock="$tmpdir/session.sock"
 sig_sock="$tmpdir/signalled.sock"
 thread_sock="$tmpdir/thread-regression.sock"
 alt_sock="$tmpdir/alternate-screen.sock"
+cwd_sock="$tmpdir/cwd-session.sock"
 first="$tmpdir/first.out"
 second="$tmpdir/second.out"
 signalled="$tmpdir/signalled.out"
@@ -24,6 +25,11 @@ thread_out="$tmpdir/thread-regression.out"
 alt_first="$tmpdir/alternate-first.out"
 alt_second="$tmpdir/alternate-second.out"
 alt_ready="$tmpdir/alternate-ready"
+cwd_dir="$tmpdir/cwd-target"
+cwd_out="$tmpdir/cwd.out"
+cwd_marker="$tmpdir/cwd-marker"
+
+mkdir -p "$cwd_dir"
 
 cargo build --quiet --bin dsesh
 
@@ -61,6 +67,28 @@ if ! grep -q '\[EOF - ended session\]' "$second"; then
   echo "ended session did not print EOF marker" >&2
   echo "--- attach output ---" >&2
   sed -n '1,120p' "$second" >&2
+  exit 1
+fi
+
+(
+  cd "$cwd_dir"
+  {
+    for _ in {1..100}; do
+      if [ -e "$cwd_marker" ]; then
+        break
+      fi
+      sleep 0.02
+    done
+    printf '\034'
+  } | "$bin" new "$cwd_sock" -- sh -c 'printf "cwd:%s\n" "$PWD" > "$1"; sleep 1' sh "$cwd_marker"
+) >"$cwd_out"
+
+if ! grep -q "cwd:$cwd_dir" "$cwd_marker"; then
+  echo "session command did not inherit dsesh invocation cwd" >&2
+  echo "--- cwd output ---" >&2
+  sed -n '1,120p' "$cwd_out" >&2
+  echo "--- cwd marker ---" >&2
+  sed -n '1,120p' "$cwd_marker" >&2 || true
   exit 1
 fi
 

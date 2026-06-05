@@ -236,6 +236,7 @@ fn start_server(socket: &Path, rows: u16, cols: u16, command: &[String]) -> Resu
         bail!("socket already exists: {}", socket.display());
     }
 
+    let cwd = std::env::current_dir().context("resolve current directory")?;
     let exe = std::env::current_exe().context("resolve current executable")?;
     let mut child = Command::new(exe);
     child
@@ -248,6 +249,7 @@ fn start_server(socket: &Path, rows: u16, cols: u16, command: &[String]) -> Resu
         .arg("--")
         .args(command)
         .env("MALLOC_ARENA_MAX", "1")
+        .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -291,6 +293,7 @@ fn server(socket: &Path, rows: u16, cols: u16, command: &[String]) -> Result<()>
 
     let mut builder = CommandBuilder::new(&command[0]);
     builder.args(&command[1..]);
+    builder.cwd(std::env::current_dir().context("resolve server current directory")?);
     let mut child = pair.slave.spawn_command(builder).context("spawn command")?;
     drop(pair.slave);
 
