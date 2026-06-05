@@ -48,6 +48,15 @@ When the socket already exists, `run` does not need a command:
 dsesh run /tmp/shell.sock
 ```
 
+The Nix flake also provides `dr`, a convenience wrapper that creates
+`/tmp/.dsesh`, chooses a UUID socket name, and runs the command through
+`dsesh run`:
+
+```sh
+nix run .#dr -- "$SHELL"
+nix run .#dr -- sh -c 'command1; command2 | command3'
+```
+
 `dsesh` prints `[detached]` after a client detaches and
 `[EOF - ended session]` when the child process exits or is terminated.
 

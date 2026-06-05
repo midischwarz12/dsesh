@@ -32,20 +32,49 @@
               installManPage doc/dsesh.1
             '';
           };
+          dr = pkgs.writeShellApplication {
+            name = "dr";
+            runtimeInputs = [ pkgs.coreutils ];
+            text = ''
+              if [ "$#" -eq 0 ]; then
+                echo "usage: dr COMMAND [ARGS...]" >&2
+                exit 64
+              fi
+
+              mkdir -p /tmp/.dsesh
+
+              if [ -r /proc/sys/kernel/random/uuid ]; then
+                IFS= read -r uuid < /proc/sys/kernel/random/uuid
+              elif command -v uuidgen >/dev/null 2>&1; then
+                uuid="$(uuidgen)"
+              else
+                echo "dr: could not generate a UUID" >&2
+                exit 1
+              fi
+
+              exec ${dsesh}/bin/dsesh run "/tmp/.dsesh/$uuid.sock" -- "$@"
+            '';
+          };
         in
         {
           default = dsesh;
           dsesh = dsesh;
+          dr = dr;
         });
 
       checks = forEachSystem (system: {
         default = self.packages.${system}.default;
+        dr = self.packages.${system}.dr;
       });
 
       apps = forEachSystem (system: {
         default = {
           type = "app";
           program = "${self.packages.${system}.dsesh}/bin/dsesh";
+        };
+        dr = {
+          type = "app";
+          program = "${self.packages.${system}.dr}/bin/dr";
         };
       });
 

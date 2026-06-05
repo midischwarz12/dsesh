@@ -31,6 +31,14 @@ Attach to an existing session socket.
 .B run SOCKET -- COMMAND [ARGS...]
 Attach to SOCKET if it exists, otherwise create the session and attach. When
 SOCKET already exists, COMMAND may be omitted.
+.SH FLAKE APPS
+.TP
+.B nix run .#dr -- COMMAND [ARGS...]
+Create
+.B /tmp/.dsesh
+and run COMMAND through
+.B dsesh run
+using a UUID-named socket under that directory.
 .SH KEYS
 .TP
 .B Ctrl-\e
