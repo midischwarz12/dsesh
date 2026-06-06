@@ -48,14 +48,17 @@ When the socket already exists, `run` does not need a command:
 dsesh run /tmp/shell.sock
 ```
 
-The Nix flake also provides `dr`, a convenience wrapper that creates
-`/tmp/.dsesh`, chooses a UUID socket name, and runs the command through
-`dsesh run`:
+The Nix flake also provides `dr`, a convenience wrapper with two modes:
 
 ```sh
 nix run .#dr -- "$SHELL"
 nix run .#dr -- sh -c 'command1; command2 | command3'
+nix run .#dr -- /tmp/.dsesh/EXISTING.sock
 ```
+
+When given a single existing Unix socket path, `dr` reattaches to that session.
+Otherwise it creates `/tmp/.dsesh`, chooses a UUID socket name, and runs the
+command through `dsesh run`.
 
 `dsesh` prints `[detached - SOCKET]` after a client detaches and
 `[EOF - ended session]` when the child process exits or is terminated.

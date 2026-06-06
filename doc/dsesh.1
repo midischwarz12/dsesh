@@ -39,6 +39,9 @@ Create
 and run COMMAND through
 .B dsesh run
 using a UUID-named socket under that directory.
+.TP
+.B nix run .#dr -- SOCKET
+Reattach to an existing Unix socket session when SOCKET already exists.
 .SH KEYS
 .TP
 .B Ctrl-\e
